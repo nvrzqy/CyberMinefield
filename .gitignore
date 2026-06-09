@@ -11,3 +11,4 @@ MemoryCaptures/
 *.csproj
 *.sln
 *.slnx
+.codex/

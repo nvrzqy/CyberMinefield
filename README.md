@@ -4,6 +4,8 @@ Cyber Minefield is a 3D logic puzzle game inspired by Minesweeper. Instead of cl
 
 This project was developed for a Computer Graphics and Visualization course. The main focus is combining 3D player interaction, procedural grid generation, puzzle logic, pixel-art UI, audio feedback, and multiple game modes into one playable Unity project.
 
+### Game can be downloaded at: https://nvrzqy.itch.io/cyber-minefield
+
 ## Gameplay Overview
 
 - Move the player with `WASD`.

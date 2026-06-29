@@ -80,6 +80,13 @@ namespace CyberMinefield.UI
 
         public void StartLevelMode()
         {
+            ResolveReferences();
+            if (gameManager != null)
+            {
+                gameManager.ShowLevelSelect();
+                return;
+            }
+
             StartMode(GameMode.Campaign, CreateLevelModeLevel());
         }
 
@@ -292,17 +299,17 @@ namespace CyberMinefield.UI
 
         private static LevelDefinition CreateLevelModeLevel()
         {
-            return new LevelDefinition("Level", 6, 6, 5, 5, 0f, new Vector2Int(3, 3), new Vector2Int(5, 5), WinConditionType.ClearSafeTiles, 19);
+            return new LevelDefinition("Level", 6, 6, 11, 11, 0f, new Vector2Int(3, 3), new Vector2Int(5, 5), WinConditionType.ClearSafeTiles, 19);
         }
 
         private static LevelDefinition CreateClassicLevel()
         {
-            return new LevelDefinition("Classic", 8, 8, 8, 8, 0f, new Vector2Int(4, 4), new Vector2Int(7, 7), WinConditionType.ClearSafeTiles, 29);
+            return new LevelDefinition("Classic", 25, 25, 120, 120, 0f, new Vector2Int(12, 12), new Vector2Int(24, 24), WinConditionType.ClearSafeTiles, 29);
         }
 
         private static LevelDefinition CreateTimeLevel()
         {
-            return new LevelDefinition("Time", 8, 8, 10, 10, 90f, new Vector2Int(4, 4), new Vector2Int(7, 7), WinConditionType.ClearSafeTiles, 39);
+            return new LevelDefinition("Time", 9, 9, 22, 22, 40f, new Vector2Int(4, 4), new Vector2Int(8, 8), WinConditionType.ClearSafeTiles, 39);
         }
     }
 }

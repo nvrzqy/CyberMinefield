@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using CyberMinefield.Levels;
 using UnityEngine;
@@ -9,6 +10,10 @@ namespace CyberMinefield.Grid
     {
         private const string GridParentName = "Grid";
         private const string BoardFloorName = "BoardFloor";
+        private const int LargeBoardArea = 225;
+        private const int LargeBoardDangerMarkerBudget = 48;
+        private const int FastLargeBoardGenerationAttempts = 32;
+        private const long AsyncGenerationFrameBudgetMs = 12L;
 
         [SerializeField] private int width = 5;
         [SerializeField] private int height = 5;
@@ -21,10 +26,12 @@ namespace CyberMinefield.Grid
         [SerializeField] private int randomSeed = 9;
         [SerializeField] private Vector2Int startPosition = Vector2Int.zero;
         [SerializeField] private Vector2Int exitPosition = new Vector2Int(4, 4);
-        [SerializeField] private int maxGenerationAttempts = 500;
+        [SerializeField] private int maxGenerationAttempts = 1200;
         [SerializeField] private int minimumInitialRevealTiles = 9;
-        [SerializeField] private float maxZeroTileRatio = 0.38f;
+        [SerializeField] private float maxZeroTileRatio = 0.08f;
+        [SerializeField] private float minimumNumberedSafeRatio = 0.74f;
         [SerializeField] private bool showTutorialHints;
+        [SerializeField] private bool randomizeStartPosition;
 
         private readonly Dictionary<Vector2Int, TileNode> tilesByCoordinate = new Dictionary<Vector2Int, TileNode>();
         private Transform gridParent;
@@ -39,13 +46,16 @@ namespace CyberMinefield.Grid
         public int RemainingDefusers => Mathf.Max(0, defuserLimit - placedDefuserCount);
         public int SafeTilesRemaining => safeTilesRemaining;
         public float TileSpacing => tileSpacing;
+        public float TileSurfaceHeight => tileScale * 0.09f;
         public Vector2Int StartPosition => startPosition;
         public Vector2Int ExitPosition => exitPosition;
         public Vector2Int TutorialTargetCoordinates { get; private set; } = new Vector2Int(int.MinValue, int.MinValue);
         public IReadOnlyDictionary<Vector2Int, TileNode> TilesByCoordinate => tilesByCoordinate;
 
         public event Action<TileNode> TileRevealed;
+        public event Action<TileNode> TileEntered;
         public event Action<TileNode> DangerTriggered;
+        public event Action<TileNode> DefuserPlaced;
         public event Action SafeTilesCleared;
         public event Action DefuserCountChanged;
 
@@ -63,6 +73,8 @@ namespace CyberMinefield.Grid
             height = Mathf.Max(2, level.Height);
             dangerCount = Mathf.Max(0, level.DangerCount);
             defuserLimit = Mathf.Max(0, level.DefuserLimit);
+            showTutorialHints = level.LevelName.StartsWith("Tutorial");
+            randomizeStartPosition = !showTutorialHints;
             startPosition = ClampToBoard(level.StartPosition);
             if (width >= 5 && height >= 5 && IsOnBoardEdge(startPosition))
             {
@@ -73,18 +85,30 @@ namespace CyberMinefield.Grid
             minimumInitialRevealTiles = Mathf.Max(
                 minimumInitialRevealTiles,
                 Mathf.Min(9, Mathf.Max(1, width * height - dangerCount)));
+            maxZeroTileRatio = Mathf.Min(maxZeroTileRatio, 0.08f);
+            minimumNumberedSafeRatio = Mathf.Max(minimumNumberedSafeRatio, 0.74f);
             useRandomSeed = false;
-            showTutorialHints = level.LevelName.StartsWith("Tutorial");
         }
 
         [ContextMenu("Generate Grid")]
         public void GenerateGrid()
+        {
+            RunToCompletion(GenerateGridRoutine(false));
+        }
+
+        public IEnumerator GenerateGridAsync()
+        {
+            yield return GenerateGridRoutine(true);
+        }
+
+        private IEnumerator GenerateGridRoutine(bool allowYield)
         {
             ClearGrid();
             gridParent = CreateGridParent();
             tilesByCoordinate.Clear();
             placedDefuserCount = 0;
             safeTilesRemaining = 0;
+            System.Diagnostics.Stopwatch generationBudget = System.Diagnostics.Stopwatch.StartNew();
 
             if (useRandomSeed)
             {
@@ -92,6 +116,11 @@ namespace CyberMinefield.Grid
             }
 
             startPosition = ClampToBoard(startPosition);
+            if (randomizeStartPosition)
+            {
+                startPosition = ChooseRandomStartPosition();
+            }
+
             exitPosition = ClampToBoard(exitPosition);
 
             for (int y = 0; y < height; y++)
@@ -100,13 +129,49 @@ namespace CyberMinefield.Grid
                 {
                     CreateTile(x, y);
                 }
+
+                if (ShouldYieldForAsyncGeneration(allowYield, generationBudget))
+                {
+                    yield return null;
+                }
             }
 
             CreateBoardFloor();
-            GeneratePlayableDangerLayout();
+
+            if (allowYield)
+            {
+                yield return GeneratePlayableDangerLayoutRoutine(true);
+            }
+            else
+            {
+                RunToCompletion(GeneratePlayableDangerLayoutRoutine(false));
+            }
+
             CountSafeTiles();
             ClearTutorialHints();
             DefuserCountChanged?.Invoke();
+        }
+
+        private static bool ShouldYieldForAsyncGeneration(bool allowYield, System.Diagnostics.Stopwatch budget)
+        {
+            if (!allowYield || budget.ElapsedMilliseconds < AsyncGenerationFrameBudgetMs)
+            {
+                return false;
+            }
+
+            budget.Restart();
+            return true;
+        }
+
+        private static void RunToCompletion(IEnumerator routine)
+        {
+            while (routine.MoveNext())
+            {
+                if (routine.Current is IEnumerator nestedRoutine)
+                {
+                    RunToCompletion(nestedRoutine);
+                }
+            }
         }
 
         public void SetTutorialStep(int stepIndex)
@@ -184,7 +249,8 @@ namespace CyberMinefield.Grid
 
         public Vector3 GetWorldPosition(Vector2Int coordinates)
         {
-            return new Vector3(coordinates.x * tileSpacing, 0f, coordinates.y * tileSpacing);
+            Vector3 localPosition = new Vector3(coordinates.x * tileSpacing, 0f, coordinates.y * tileSpacing);
+            return transform.TransformPoint(localPosition);
         }
 
         public bool ToggleDefuser(Vector2Int coordinates)
@@ -200,10 +266,42 @@ namespace CyberMinefield.Grid
                 return false;
             }
 
+            bool hadDefuser = tile.HasDefuser;
             bool hasDefuser = tile.ToggleDefuser();
             placedDefuserCount += hasDefuser ? 1 : -1;
+            if (hasDefuser)
+            {
+                DefuserPlaced?.Invoke(tile);
+            }
+
             DefuserCountChanged?.Invoke();
+
+            if (hadDefuser && !hasDefuser && tile.IsPlayerOccupying)
+            {
+                RevealTile(coordinates);
+            }
+
             return true;
+        }
+
+        public void NotifyTileEntered(Vector2Int coordinates)
+        {
+            if (tilesByCoordinate.TryGetValue(coordinates, out TileNode tile))
+            {
+                TileEntered?.Invoke(tile);
+            }
+        }
+
+        private void RemoveDefuserForAutoReveal(TileNode tile)
+        {
+            if (tile == null || !tile.HasDefuser)
+            {
+                return;
+            }
+
+            tile.ToggleDefuser();
+            placedDefuserCount = Mathf.Max(0, placedDefuserCount - 1);
+            DefuserCountChanged?.Invoke();
         }
 
         public TileRevealResult RevealTile(Vector2Int coordinates)
@@ -211,6 +309,13 @@ namespace CyberMinefield.Grid
             if (!tilesByCoordinate.TryGetValue(coordinates, out TileNode tile))
             {
                 return TileRevealResult.Invalid;
+            }
+
+            if (tile.HasDefuser)
+            {
+                return tile.HasDanger
+                    ? TileRevealResult.DangerNeutralized
+                    : TileRevealResult.NoChange;
             }
 
             if (!tile.TryReveal())
@@ -244,7 +349,7 @@ namespace CyberMinefield.Grid
 
         public int RevealStartingArea(Vector2Int coordinates)
         {
-            HashSet<Vector2Int> revealSet = BuildFloodRevealSet(coordinates);
+            HashSet<Vector2Int> revealSet = BuildInitialRevealSet(coordinates);
             int revealedCount = 0;
 
             foreach (Vector2Int revealCoordinates in revealSet)
@@ -264,18 +369,79 @@ namespace CyberMinefield.Grid
             RevealResultTiles();
         }
 
-        public void RevealResultTiles()
+        public void RevealResultTiles(int maxDangerMarkers = int.MaxValue)
         {
+            int shownDangerMarkers = 0;
+
             foreach (TileNode tile in tilesByCoordinate.Values)
             {
                 if (tile.HasDanger)
                 {
-                    tile.RevealDangerForResult();
+                    bool showMarker = shownDangerMarkers < maxDangerMarkers;
+                    tile.RevealDangerForResult(showMarker);
+                    if (showMarker)
+                    {
+                        shownDangerMarkers++;
+                    }
                 }
                 else if (tile.HasDefuser)
                 {
                     tile.RevealMisflagForResult();
                 }
+            }
+        }
+
+        public IEnumerator PlayLoseVirusSpread()
+        {
+            bool largeBoard = width * height > LargeBoardArea;
+            int dangerMarkerBudget = largeBoard ? LargeBoardDangerMarkerBudget : int.MaxValue;
+            RevealResultTiles(dangerMarkerBudget);
+
+            yield return new WaitForSeconds(3f);
+
+            List<Vector2Int> dangerCoordinates = new List<Vector2Int>();
+            foreach (TileNode tile in tilesByCoordinate.Values)
+            {
+                if (tile.HasDanger)
+                {
+                    dangerCoordinates.Add(tile.Coordinates);
+                }
+            }
+
+            List<VirusSpreadEntry> spreadEntries = new List<VirusSpreadEntry>();
+            foreach (TileNode tile in tilesByCoordinate.Values)
+            {
+                if (tile.HasDanger)
+                {
+                    continue;
+                }
+
+                spreadEntries.Add(new VirusSpreadEntry(tile, GetNearestDangerDistance(tile.Coordinates, dangerCoordinates)));
+            }
+
+            spreadEntries.Sort((left, right) =>
+            {
+                int distanceComparison = left.Distance.CompareTo(right.Distance);
+                if (distanceComparison != 0)
+                {
+                    return distanceComparison;
+                }
+
+                int rowComparison = left.Tile.Y.CompareTo(right.Tile.Y);
+                return rowComparison != 0 ? rowComparison : left.Tile.X.CompareTo(right.Tile.X);
+            });
+
+            int currentDistance = -1;
+            for (int i = 0; i < spreadEntries.Count; i++)
+            {
+                VirusSpreadEntry entry = spreadEntries[i];
+                if (currentDistance >= 0 && entry.Distance != currentDistance)
+                {
+                    yield return new WaitForSeconds(0.055f);
+                }
+
+                currentDistance = entry.Distance;
+                entry.Tile.InfectWithVirusSpread(false);
             }
         }
 
@@ -287,6 +453,37 @@ namespace CyberMinefield.Grid
                 tile.PlayWinEffect(index);
                 index++;
             }
+        }
+
+        private int GetNearestDangerDistance(Vector2Int coordinates, List<Vector2Int> dangerCoordinates)
+        {
+            if (dangerCoordinates.Count == 0)
+            {
+                Vector2Int center = new Vector2Int(width / 2, height / 2);
+                return Mathf.Abs(coordinates.x - center.x) + Mathf.Abs(coordinates.y - center.y);
+            }
+
+            int bestDistance = int.MaxValue;
+            for (int i = 0; i < dangerCoordinates.Count; i++)
+            {
+                Vector2Int danger = dangerCoordinates[i];
+                int distance = Mathf.Abs(coordinates.x - danger.x) + Mathf.Abs(coordinates.y - danger.y);
+                bestDistance = Mathf.Min(bestDistance, distance);
+            }
+
+            return bestDistance;
+        }
+
+        private readonly struct VirusSpreadEntry
+        {
+            public VirusSpreadEntry(TileNode tile, int distance)
+            {
+                Tile = tile;
+                Distance = distance;
+            }
+
+            public TileNode Tile { get; }
+            public int Distance { get; }
         }
 
         private Transform CreateGridParent()
@@ -337,73 +534,246 @@ namespace CyberMinefield.Grid
 
         private void GeneratePlayableDangerLayout()
         {
-            bool generated = false;
-            int bestInitialRevealCount = -1;
-            HashSet<Vector2Int> bestDangerCoordinates = new HashSet<Vector2Int>();
-            int bestSolvableInitialRevealCount = -1;
-            HashSet<Vector2Int> bestSolvableDangerCoordinates = new HashSet<Vector2Int>();
+            RunToCompletion(GeneratePlayableDangerLayoutRoutine(false));
+        }
 
-            int attemptLimit = maxGenerationAttempts;
-
-            for (int attempt = 0; attempt < attemptLimit; attempt++)
+        private IEnumerator GeneratePlayableDangerLayoutRoutine(bool allowYield)
+        {
+            if (width * height > LargeBoardArea)
             {
-                ResetTileGameplayState();
-                PlaceDangers();
-                CalculateAdjacentDangerCounts();
+                yield return GenerateFastLargeBoardDangerLayoutRoutine(allowYield);
+                yield break;
+            }
 
-                HashSet<Vector2Int> initialRevealSet = BuildFloodRevealSet(startPosition);
-                int zeroCount = CountZeroSafeTiles();
-                bool hasEnoughOpening = initialRevealSet.Count >= Mathf.Min(minimumInitialRevealTiles, width * height - dangerCount);
-                bool hasControlledZeroCount = zeroCount <= Mathf.CeilToInt((width * height - dangerCount) * maxZeroTileRatio);
-                bool isSolvable = CanSolveWithoutGuessing(initialRevealSet);
+            int requestedDangerCount = dangerCount;
+            int selectedDangerCount = dangerCount;
+            bool selectedBoard = false;
+            bool relaxedDensityTargets = false;
+            bool reducedDangerCount = false;
+            HashSet<Vector2Int> selectedDangerCoordinates = new HashSet<Vector2Int>();
+            System.Diagnostics.Stopwatch generationBudget = System.Diagnostics.Stopwatch.StartNew();
 
-                if (initialRevealSet.Count > bestInitialRevealCount)
+            for (int candidateDangerCount = requestedDangerCount; candidateDangerCount >= 0 && !selectedBoard; candidateDangerCount--)
+            {
+                dangerCount = candidateDangerCount;
+                int bestSolvableBoardScore = int.MinValue;
+                HashSet<Vector2Int> bestSolvableDangerCoordinates = new HashSet<Vector2Int>();
+                int attemptLimit = Mathf.Max(maxGenerationAttempts, width * height * 8);
+
+                for (int attempt = 0; attempt < attemptLimit; attempt++)
                 {
-                    bestInitialRevealCount = initialRevealSet.Count;
-                    bestDangerCoordinates = CaptureDangerCoordinates();
+                    ResetTileGameplayState();
+                    PlaceDangers();
+                    CalculateAdjacentDangerCounts();
+
+                    HashSet<Vector2Int> initialRevealSet = BuildInitialRevealSet(startPosition);
+                    int zeroCount = CountZeroSafeTiles();
+                    int numberedCount = CountNumberedSafeTiles();
+                    int highNumberCount = CountHighNumberSafeTiles();
+                    int safeCount = Mathf.Max(1, width * height - dangerCount);
+                    int boardScore = ScoreBoard(initialRevealSet.Count, zeroCount, numberedCount, highNumberCount);
+                    bool hasEnoughOpening = initialRevealSet.Count >= Mathf.Min(minimumInitialRevealTiles, width * height - dangerCount);
+                    bool hasControlledZeroCount = zeroCount <= Mathf.CeilToInt((width * height - dangerCount) * maxZeroTileRatio);
+                    bool hasEnoughNumbers = numberedCount >= Mathf.FloorToInt(safeCount * minimumNumberedSafeRatio);
+                    bool isSolvable = CanSolveWithoutGuessing(initialRevealSet);
+
+                    if (hasEnoughOpening && isSolvable && boardScore > bestSolvableBoardScore)
+                    {
+                        bestSolvableBoardScore = boardScore;
+                        bestSolvableDangerCoordinates = CaptureDangerCoordinates();
+                    }
+
+                    if (hasEnoughOpening && hasControlledZeroCount && hasEnoughNumbers && isSolvable)
+                    {
+                        selectedBoard = true;
+                        selectedDangerCount = candidateDangerCount;
+                        selectedDangerCoordinates = CaptureDangerCoordinates();
+                        reducedDangerCount = candidateDangerCount != requestedDangerCount;
+                        break;
+                    }
+
+                    if (ShouldYieldForAsyncGeneration(allowYield, generationBudget))
+                    {
+                        yield return null;
+                    }
                 }
 
-                if (hasEnoughOpening && isSolvable && initialRevealSet.Count > bestSolvableInitialRevealCount)
+                if (!selectedBoard && bestSolvableBoardScore > int.MinValue)
                 {
-                    bestSolvableInitialRevealCount = initialRevealSet.Count;
-                    bestSolvableDangerCoordinates = CaptureDangerCoordinates();
+                    selectedBoard = true;
+                    relaxedDensityTargets = true;
+                    selectedDangerCount = candidateDangerCount;
+                    selectedDangerCoordinates = bestSolvableDangerCoordinates;
+                    reducedDangerCount = candidateDangerCount != requestedDangerCount;
                 }
 
-                if (hasEnoughOpening && hasControlledZeroCount && isSolvable)
+                if (ShouldYieldForAsyncGeneration(allowYield, generationBudget))
                 {
-                    generated = true;
-                    break;
+                    yield return null;
                 }
             }
 
-            if (!generated)
-            {
-                ResetTileGameplayState();
-                if (bestSolvableInitialRevealCount >= 0)
-                {
-                    RestoreDangerCoordinates(bestSolvableDangerCoordinates);
-                    Debug.LogWarning("Using a solver-verified board with a larger opening; zero-tile ratio target was relaxed.", this);
-                }
-                else
-                {
-                    RestoreDangerCoordinates(bestDangerCoordinates);
-                    Debug.LogWarning("Could not find a fully solver-verified board in time; using the best opening found.", this);
-                }
+            ResetTileGameplayState();
+            dangerCount = selectedBoard ? selectedDangerCount : 0;
+            RestoreDangerCoordinates(selectedDangerCoordinates);
+            CalculateAdjacentDangerCounts();
 
-                CalculateAdjacentDangerCounts();
+            if (!selectedBoard)
+            {
+                defuserLimit = 0;
+                Debug.LogError("Could not find a solver-verified board; generated a safe training board instead.", this);
+            }
+            else if (reducedDangerCount)
+            {
+                defuserLimit = Mathf.Min(defuserLimit, dangerCount);
+                Debug.LogWarning($"Reduced danger count from {requestedDangerCount} to {dangerCount} to keep this board solver-verified.", this);
+            }
+            else if (relaxedDensityTargets)
+            {
+                Debug.LogWarning("Using a solver-verified board with relaxed density targets.", this);
             }
 
             ClearExitMarkers();
-            EnsureSpawnOpening();
+            if (allowYield)
+            {
+                yield return EnsureSpawnOpeningRoutine(true);
+            }
+            else
+            {
+                RunToCompletion(EnsureSpawnOpeningRoutine(false));
+            }
+        }
+
+        private IEnumerator GenerateFastLargeBoardDangerLayoutRoutine(bool allowYield)
+        {
+            int requestedDangerCount = dangerCount;
+            int bestScore = int.MinValue;
+            HashSet<Vector2Int> bestDangerCoordinates = new HashSet<Vector2Int>();
+            System.Diagnostics.Stopwatch generationBudget = System.Diagnostics.Stopwatch.StartNew();
+
+            for (int attempt = 0; attempt < FastLargeBoardGenerationAttempts; attempt++)
+            {
+                ResetTileGameplayState();
+                PlaceDangers(GetProtectedStartCoordinates(1));
+                CalculateAdjacentDangerCounts();
+
+                HashSet<Vector2Int> initialRevealSet = BuildInitialRevealSet(startPosition);
+                int zeroCount = CountZeroSafeTiles();
+                int numberedCount = CountNumberedSafeTiles();
+                int highNumberCount = CountHighNumberSafeTiles();
+                int safeCount = Mathf.Max(1, width * height - dangerCount);
+                int desiredOpening = Mathf.Min(minimumInitialRevealTiles, safeCount);
+                int score = ScoreBoard(initialRevealSet.Count, zeroCount, numberedCount, highNumberCount);
+
+                if (initialRevealSet.Count < desiredOpening)
+                {
+                    score -= (desiredOpening - initialRevealSet.Count) * 500;
+                }
+
+                if (tilesByCoordinate.TryGetValue(startPosition, out TileNode startTile))
+                {
+                    score += startTile.AdjacentDangerCount * 40;
+                }
+
+                score += CountRevealedFrontierClues(initialRevealSet) * 18;
+                score -= Mathf.Abs(requestedDangerCount - dangerCount) * 300;
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestDangerCoordinates = CaptureDangerCoordinates();
+                }
+
+                bool hasEnoughOpening = initialRevealSet.Count >= desiredOpening;
+                bool hasEnoughNumbers = numberedCount >= Mathf.FloorToInt(safeCount * 0.68f);
+                bool hasControlledZeroCount = zeroCount <= Mathf.CeilToInt(safeCount * 0.14f);
+                if (attempt >= 8 && hasEnoughOpening && hasEnoughNumbers && hasControlledZeroCount)
+                {
+                    break;
+                }
+
+                if (ShouldYieldForAsyncGeneration(allowYield, generationBudget))
+                {
+                    yield return null;
+                }
+            }
+
+            ResetTileGameplayState();
+            dangerCount = requestedDangerCount;
+            RestoreDangerCoordinates(bestDangerCoordinates);
+            CalculateAdjacentDangerCounts();
+            EnsureFastLargeBoardSpawnOpening();
+            ClearExitMarkers();
         }
 
         private void EnsureSpawnOpening()
         {
-            HashSet<Vector2Int> revealSet = BuildFloodRevealSet(startPosition);
+            RunToCompletion(EnsureSpawnOpeningRoutine(false));
+        }
+
+        private void EnsureFastLargeBoardSpawnOpening()
+        {
             int desiredRevealCount = Mathf.Min(minimumInitialRevealTiles, width * height - dangerCount);
-            if (IsSpawnOpeningAcceptable(revealSet, desiredRevealCount))
+            HashSet<Vector2Int> revealSet = BuildInitialRevealSet(startPosition);
+            if (revealSet.Count >= desiredRevealCount)
             {
                 return;
+            }
+
+            HashSet<Vector2Int> protectedOpening = GetProtectedStartCoordinates(1);
+            RelocateDangersAwayFrom(protectedOpening);
+            CalculateAdjacentDangerCounts();
+
+            revealSet = BuildInitialRevealSet(startPosition);
+            if (revealSet.Count >= desiredRevealCount)
+            {
+                return;
+            }
+
+            protectedOpening = GetProtectedStartCoordinates(2);
+            RelocateDangersAwayFrom(protectedOpening);
+            CalculateAdjacentDangerCounts();
+        }
+
+        private IEnumerator EnsureSpawnOpeningRoutine(bool allowYield)
+        {
+            Vector2Int bestStart = startPosition;
+            HashSet<Vector2Int> revealSet = BuildInitialRevealSet(startPosition);
+            int desiredRevealCount = Mathf.Min(minimumInitialRevealTiles, width * height - dangerCount);
+            int bestScore = ScoreStartPosition(startPosition, revealSet);
+            System.Diagnostics.Stopwatch generationBudget = System.Diagnostics.Stopwatch.StartNew();
+
+            foreach (TileNode tile in tilesByCoordinate.Values)
+            {
+                if (tile.HasDanger || IsOnBoardEdge(tile.Coordinates))
+                {
+                    continue;
+                }
+
+                HashSet<Vector2Int> candidateRevealSet = BuildInitialRevealSet(tile.Coordinates);
+                if (!IsSpawnOpeningAcceptable(tile.Coordinates, candidateRevealSet, desiredRevealCount))
+                {
+                    continue;
+                }
+
+                int candidateScore = ScoreStartPosition(tile.Coordinates, candidateRevealSet);
+                if (candidateScore > bestScore)
+                {
+                    bestStart = tile.Coordinates;
+                    revealSet = candidateRevealSet;
+                    bestScore = candidateScore;
+                }
+
+                if (ShouldYieldForAsyncGeneration(allowYield, generationBudget))
+                {
+                    yield return null;
+                }
+            }
+
+            if (bestStart != startPosition)
+            {
+                startPosition = bestStart;
+                yield break;
             }
 
             HashSet<Vector2Int> originalDangers = CaptureDangerCoordinates();
@@ -417,7 +787,17 @@ namespace CyberMinefield.Grid
                 ResetTileGameplayState();
                 RestoreDangerCoordinates(originalDangers);
 
-                HashSet<Vector2Int> protectedOpening = GetCoordinatesWithinRadius(startPosition, radius);
+                HashSet<Vector2Int> protectedOpening = new HashSet<Vector2Int> { startPosition };
+                foreach (Vector2Int candidate in GetCoordinatesWithinRadius(startPosition, radius))
+                {
+                    if (tilesByCoordinate.TryGetValue(candidate, out TileNode tile)
+                        && !tile.HasDanger
+                        && protectedOpening.Count < desiredRevealCount)
+                    {
+                        protectedOpening.Add(candidate);
+                    }
+                }
+
                 if (width * height - protectedOpening.Count < dangerCount)
                 {
                     continue;
@@ -426,7 +806,7 @@ namespace CyberMinefield.Grid
                 RelocateDangersAwayFrom(protectedOpening);
                 CalculateAdjacentDangerCounts();
 
-                revealSet = BuildFloodRevealSet(startPosition);
+                revealSet = BuildInitialRevealSet(startPosition);
                 bool isSolvable = CanSolveWithoutGuessing(revealSet);
                 if ((isSolvable && !bestIsSolvable) || (isSolvable == bestIsSolvable && revealSet.Count > bestRevealCount))
                 {
@@ -435,9 +815,14 @@ namespace CyberMinefield.Grid
                     bestDangers = CaptureDangerCoordinates();
                 }
 
-                if (IsSpawnOpeningAcceptable(revealSet, desiredRevealCount))
+                if (IsSpawnOpeningAcceptable(startPosition, revealSet, desiredRevealCount))
                 {
-                    return;
+                    yield break;
+                }
+
+                if (ShouldYieldForAsyncGeneration(allowYield, generationBudget))
+                {
+                    yield return null;
                 }
             }
 
@@ -447,12 +832,11 @@ namespace CyberMinefield.Grid
             Debug.LogWarning("Spawn opening was adjusted to avoid a one-tile start.", this);
         }
 
-        private bool IsSpawnOpeningAcceptable(HashSet<Vector2Int> revealSet, int desiredRevealCount)
+        private bool IsSpawnOpeningAcceptable(Vector2Int candidateStart, HashSet<Vector2Int> revealSet, int desiredRevealCount)
         {
             return revealSet.Count >= desiredRevealCount
-                && tilesByCoordinate.TryGetValue(startPosition, out TileNode startTile)
+                && tilesByCoordinate.TryGetValue(candidateStart, out TileNode startTile)
                 && !startTile.HasDanger
-                && startTile.AdjacentDangerCount == 0
                 && CanSolveWithoutGuessing(revealSet);
         }
 
@@ -522,6 +906,18 @@ namespace CyberMinefield.Grid
             return x * x + y * y;
         }
 
+        private Vector2Int ChooseRandomStartPosition()
+        {
+            int minX = width > 4 ? 1 : 0;
+            int minY = height > 4 ? 1 : 0;
+            int maxX = width > 4 ? width - 2 : width - 1;
+            int maxY = height > 4 ? height - 2 : height - 1;
+
+            return new Vector2Int(
+                UnityEngine.Random.Range(minX, maxX + 1),
+                UnityEngine.Random.Range(minY, maxY + 1));
+        }
+
         private int RevealConnectedSafeTiles(TileNode startTile)
         {
             int revealedSafeTiles = 1;
@@ -546,6 +942,11 @@ namespace CyberMinefield.Grid
                     continue;
                 }
 
+                if (tile.HasDefuser)
+                {
+                    RemoveDefuserForAutoReveal(tile);
+                }
+
                 if (tile.TryReveal())
                 {
                     TileRevealed?.Invoke(tile);
@@ -566,8 +967,11 @@ namespace CyberMinefield.Grid
 
         private void PlaceDangers()
         {
-            HashSet<Vector2Int> protectedCoordinates = GetProtectedStartCoordinates();
+            PlaceDangers(GetProtectedStartCoordinates());
+        }
 
+        private void PlaceDangers(HashSet<Vector2Int> protectedCoordinates)
+        {
             int availableTileCount = Mathf.Max(0, width * height - protectedCoordinates.Count);
             int dangersToPlace = Mathf.Clamp(dangerCount, 0, availableTileCount);
             List<Vector2Int> availableCoordinates = new List<Vector2Int>(tilesByCoordinate.Keys);
@@ -596,12 +1000,48 @@ namespace CyberMinefield.Grid
             }
         }
 
-        private void ClearTutorialHints()
+        public void ClearTutorialHints()
         {
             foreach (TileNode tile in tilesByCoordinate.Values)
             {
                 tile.ClearTutorialHint();
             }
+        }
+
+        public bool SetTutorialHintAt(Vector2Int coordinates, string text, Color color)
+        {
+            ClearTutorialHints();
+            TutorialTargetCoordinates = new Vector2Int(int.MinValue, int.MinValue);
+
+            if (!tilesByCoordinate.TryGetValue(coordinates, out TileNode tile))
+            {
+                return false;
+            }
+
+            TutorialTargetCoordinates = coordinates;
+            tile.SetTutorialHint(text, color);
+            return true;
+        }
+
+        public bool SetTutorialClearHintNear(Vector2Int anchorCoordinates, string text, Color color)
+        {
+            ClearTutorialHints();
+            TutorialTargetCoordinates = new Vector2Int(int.MinValue, int.MinValue);
+
+            TileNode target = FindClearTutorialTileNear(anchorCoordinates);
+            if (target == null)
+            {
+                target = FindClearTutorialTile();
+            }
+
+            if (target == null)
+            {
+                return false;
+            }
+
+            TutorialTargetCoordinates = target.Coordinates;
+            target.SetTutorialHint(text, color);
+            return true;
         }
 
         private TileNode FindClearTutorialTile()
@@ -641,6 +1081,96 @@ namespace CyberMinefield.Grid
             }
 
             return null;
+        }
+
+        private TileNode FindClearTutorialTileNear(Vector2Int anchorCoordinates)
+        {
+            if (!IsInsideBoard(anchorCoordinates))
+            {
+                return null;
+            }
+
+            List<TileNode> clueTiles = new List<TileNode>();
+            foreach (Vector2Int clueCoordinates in GetNeighborCoordinates(anchorCoordinates))
+            {
+                TileNode clueTile = tilesByCoordinate[clueCoordinates];
+                if (clueTile.IsRevealed && !clueTile.HasDanger && clueTile.AdjacentDangerCount > 0)
+                {
+                    clueTiles.Add(clueTile);
+                }
+            }
+
+            clueTiles.Sort((left, right) =>
+            {
+                int leftSatisfied = IsClueSatisfied(left) ? 0 : 1;
+                int rightSatisfied = IsClueSatisfied(right) ? 0 : 1;
+                if (leftSatisfied != rightSatisfied)
+                {
+                    return leftSatisfied.CompareTo(rightSatisfied);
+                }
+
+                int countComparison = left.AdjacentDangerCount.CompareTo(right.AdjacentDangerCount);
+                if (countComparison != 0)
+                {
+                    return countComparison;
+                }
+
+                return SquaredDistance(left.Coordinates, anchorCoordinates)
+                    .CompareTo(SquaredDistance(right.Coordinates, anchorCoordinates));
+            });
+
+            foreach (TileNode clueTile in clueTiles)
+            {
+                TileNode candidate = FindUnrevealedSafeNeighbor(clueTile.Coordinates, anchorCoordinates);
+                if (candidate != null)
+                {
+                    return candidate;
+                }
+            }
+
+            return FindUnrevealedSafeNeighbor(anchorCoordinates, anchorCoordinates);
+        }
+
+        private TileNode FindUnrevealedSafeNeighbor(Vector2Int centerCoordinates, Vector2Int sortAnchor)
+        {
+            List<TileNode> candidates = new List<TileNode>();
+            foreach (Vector2Int neighborCoordinates in GetNeighborCoordinates(centerCoordinates))
+            {
+                TileNode tile = tilesByCoordinate[neighborCoordinates];
+                if (!tile.IsRevealed && !tile.HasDanger)
+                {
+                    candidates.Add(tile);
+                }
+            }
+
+            candidates.Sort((left, right) =>
+            {
+                int leftNumbered = left.AdjacentDangerCount > 0 ? 0 : 1;
+                int rightNumbered = right.AdjacentDangerCount > 0 ? 0 : 1;
+                if (leftNumbered != rightNumbered)
+                {
+                    return leftNumbered.CompareTo(rightNumbered);
+                }
+
+                return SquaredDistance(left.Coordinates, sortAnchor)
+                    .CompareTo(SquaredDistance(right.Coordinates, sortAnchor));
+            });
+
+            return candidates.Count > 0 ? candidates[0] : null;
+        }
+
+        private bool IsClueSatisfied(TileNode clueTile)
+        {
+            int adjacentDefusers = 0;
+            foreach (Vector2Int neighborCoordinates in GetNeighborCoordinates(clueTile.Coordinates))
+            {
+                if (tilesByCoordinate[neighborCoordinates].HasDefuser)
+                {
+                    adjacentDefusers++;
+                }
+            }
+
+            return adjacentDefusers >= clueTile.AdjacentDangerCount;
         }
 
         private TileNode FindDefuseTutorialTile()
@@ -733,16 +1263,128 @@ namespace CyberMinefield.Grid
             return neighbors;
         }
 
-        private HashSet<Vector2Int> GetProtectedStartCoordinates()
+        private HashSet<Vector2Int> GetProtectedStartCoordinates(int radius = 0)
         {
             HashSet<Vector2Int> protectedCoordinates = new HashSet<Vector2Int> { startPosition };
-
-            foreach (Vector2Int neighbor in GetNeighborCoordinates(startPosition))
+            if (radius <= 0)
             {
-                protectedCoordinates.Add(neighbor);
+                return protectedCoordinates;
+            }
+
+            foreach (Vector2Int coordinate in GetCoordinatesWithinRadius(startPosition, radius))
+            {
+                protectedCoordinates.Add(coordinate);
             }
 
             return protectedCoordinates;
+        }
+
+        private HashSet<Vector2Int> BuildInitialRevealSet(Vector2Int coordinates)
+        {
+            HashSet<Vector2Int> revealSet = new HashSet<Vector2Int>();
+            if (!tilesByCoordinate.TryGetValue(coordinates, out TileNode startTile) || startTile.HasDanger)
+            {
+                return revealSet;
+            }
+
+            revealSet.Add(coordinates);
+
+            List<TileNode> candidates = new List<TileNode>();
+            foreach (TileNode tile in tilesByCoordinate.Values)
+            {
+                if (tile.HasDanger || tile.Coordinates == coordinates)
+                {
+                    continue;
+                }
+
+                int distance = SquaredDistance(tile.Coordinates, coordinates);
+                if (distance <= 9)
+                {
+                    candidates.Add(tile);
+                }
+            }
+
+            candidates.Sort((left, right) =>
+            {
+                int leftZeroPenalty = left.AdjacentDangerCount == 0 ? 100 : 0;
+                int rightZeroPenalty = right.AdjacentDangerCount == 0 ? 100 : 0;
+                int leftScore = leftZeroPenalty + SquaredDistance(left.Coordinates, coordinates) * 4 - left.AdjacentDangerCount;
+                int rightScore = rightZeroPenalty + SquaredDistance(right.Coordinates, coordinates) * 4 - right.AdjacentDangerCount;
+                return leftScore.CompareTo(rightScore);
+            });
+
+            int desiredRevealCount = Mathf.Min(minimumInitialRevealTiles, width * height - dangerCount);
+            foreach (TileNode tile in candidates)
+            {
+                if (revealSet.Count >= desiredRevealCount)
+                {
+                    break;
+                }
+
+                revealSet.Add(tile.Coordinates);
+            }
+
+            if (startTile.AdjacentDangerCount == 0)
+            {
+                foreach (Vector2Int floodCoordinate in BuildFloodRevealSet(coordinates))
+                {
+                    revealSet.Add(floodCoordinate);
+                }
+            }
+
+            return revealSet;
+        }
+
+        private int ScoreStartPosition(Vector2Int coordinates, HashSet<Vector2Int> revealSet)
+        {
+            if (revealSet.Count == 0 || !tilesByCoordinate.TryGetValue(coordinates, out TileNode startTile))
+            {
+                return int.MinValue;
+            }
+
+            int score = revealSet.Count * 10;
+            score += startTile.AdjacentDangerCount * 16;
+
+            foreach (Vector2Int revealCoordinate in revealSet)
+            {
+                TileNode tile = tilesByCoordinate[revealCoordinate];
+                score += tile.AdjacentDangerCount * 8;
+                if (tile.AdjacentDangerCount == 0)
+                {
+                    score -= 35;
+                }
+            }
+
+            if (startTile.AdjacentDangerCount == 0)
+            {
+                score -= 80;
+            }
+
+            return score;
+        }
+
+        private int CountRevealedFrontierClues(HashSet<Vector2Int> revealSet)
+        {
+            int clueCount = 0;
+            foreach (Vector2Int revealCoordinate in revealSet)
+            {
+                TileNode tile = tilesByCoordinate[revealCoordinate];
+                if (tile.AdjacentDangerCount <= 0)
+                {
+                    continue;
+                }
+
+                foreach (Vector2Int neighbor in GetNeighborCoordinates(revealCoordinate))
+                {
+                    if (!revealSet.Contains(neighbor))
+                    {
+                        clueCount++;
+                        break;
+                    }
+                }
+            }
+
+            return clueCount;
         }
 
         private HashSet<Vector2Int> BuildFloodRevealSet(Vector2Int coordinates)
@@ -874,6 +1516,44 @@ namespace CyberMinefield.Grid
             }
 
             return zeroCount;
+        }
+
+        private int CountNumberedSafeTiles()
+        {
+            int numberedCount = 0;
+
+            foreach (TileNode tile in tilesByCoordinate.Values)
+            {
+                if (!tile.HasDanger && tile.AdjacentDangerCount > 0)
+                {
+                    numberedCount++;
+                }
+            }
+
+            return numberedCount;
+        }
+
+        private int CountHighNumberSafeTiles()
+        {
+            int highNumberCount = 0;
+
+            foreach (TileNode tile in tilesByCoordinate.Values)
+            {
+                if (!tile.HasDanger && tile.AdjacentDangerCount >= 4)
+                {
+                    highNumberCount++;
+                }
+            }
+
+            return highNumberCount;
+        }
+
+        private static int ScoreBoard(int initialRevealCount, int zeroCount, int numberedCount, int highNumberCount)
+        {
+            return initialRevealCount * 40
+                + numberedCount * 24
+                + highNumberCount * 36
+                - zeroCount * 90;
         }
 
         private HashSet<Vector2Int> CaptureDangerCoordinates()

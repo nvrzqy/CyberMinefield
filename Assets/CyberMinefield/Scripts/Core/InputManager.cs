@@ -27,6 +27,7 @@ namespace CyberMinefield.Core
         private float cameraPitch = 42f;
         private bool jumpPressed;
         private bool wasRightMouseHeld;
+        private bool hasConfiguredCameraMode;
         private Vector2 lastMousePosition;
         private int lastCameraDragFrame = -1;
         private int lastDefuserToggleFrame = -1;
@@ -94,11 +95,17 @@ namespace CyberMinefield.Core
             playerController = player;
             gameManager = manager;
             ResolveCamera();
-            cameraLocked = false;
+            if (!hasConfiguredCameraMode)
+            {
+                cameraLocked = false;
+                lockedZoomScale = 1f;
+                hasConfiguredCameraMode = true;
+            }
+
             cameraYaw = 45f;
             cameraPitch = 48f;
             cameraDistance = Mathf.Clamp(cameraDistance, minCameraDistance, maxCameraDistance);
-            lockedZoomScale = 1f;
+            lockedZoomScale = Mathf.Clamp(lockedZoomScale, 0.45f, 1.8f);
             wasRightMouseHeld = false;
             lastMousePosition = GetMousePosition();
             ApplyCameraModeImmediately();
@@ -431,12 +438,19 @@ namespace CyberMinefield.Core
 
         private Vector3 GetLockedCameraFocus()
         {
+            if (playerController != null && playerController.gameObject.activeInHierarchy)
+            {
+                Vector3 playerPosition = playerController.transform.position;
+                return new Vector3(playerPosition.x, 0f, playerPosition.z);
+            }
+
             if (gridManager != null)
             {
-                return new Vector3(
+                Vector3 localCenter = new Vector3(
                     (gridManager.Width - 1) * gridManager.TileSpacing * 0.5f,
                     0f,
                     (gridManager.Height - 1) * gridManager.TileSpacing * 0.5f);
+                return gridManager.transform.TransformPoint(localCenter);
             }
 
             return GetCameraFocus();

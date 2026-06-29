@@ -12,3 +12,9 @@ MemoryCaptures/
 *.sln
 *.slnx
 .codex/
+.dotnet/
+.agents/
+Assets/CyberMinefield/Documentation/
+Assets/_Recovery/
+Assets/tes.unity
+Assets/tes.unity.meta

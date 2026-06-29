@@ -1,6 +1,7 @@
 {
   "dependencies": {
     "com.gamelovers.mcp-unity": "https://github.com/CoderGamester/mcp-unity.git",
+    "com.atteneder.gltfast": "https://github.com/atteneder/glTFast.git#66aa58252bafe6f7f48031f4906f807f95a3f396",
     "com.unity.ai.navigation": "2.0.12",
     "com.unity.collab-proxy": "2.12.4",
     "com.unity.ide.rider": "3.0.40",

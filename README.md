@@ -208,9 +208,7 @@ The following folders/files should not be uploaded to GitHub:
 - `Temp/`
 - `Logs/`
 - `UserSettings/`
-- `.dotnet/`
-- `.codex/`
-- `.agents/`
+
 - executable build files such as `.exe`
 
 These files are ignored through `.gitignore` so the repository stays lightweight and can be opened properly by Unity after cloning.
